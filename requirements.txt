@@ -1,2 +1,1 @@
-pandas>=2.0
-pytrends>=4.9
+# 只用 Python 3.10+ 标准库，没有第三方依赖。

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """游戏新词雷达：盯 Steam 即将发售和新品，抢在 Google 有人搜之前找到值得做攻略站的游戏词。
-用法: python3 game_radar.py --slot <morning|evening> [--no-save] [--max-new 15] [--min-demo 500]
+用法: python3 game_radar.py --slot <morning|evening> [--no-save] [--max-new 15] [--min-demo 250] [--no-roblox]
 
 不用任何对比词（GPTs、锚点都不用），热度只看游戏自己的数据：
   来源      Steam 热门即将发售（主）、热门新品、按发售日排序（补漏，要试玩版够热才收）、FindNews 新游戏（补充）
@@ -20,7 +20,7 @@
   out/<YYYYMMDD>_<slot>/games.json 本轮完整数据（含评测原文样本）
   out/<YYYYMMDD>_<slot>/report.md  中文播报草稿；目录已存在时加 _2、_3，不覆盖
 退出码：0 至少拿到一个 Steam 榜单；1 Steam 榜单全部拿不到（不能当作「今天没有新游戏」，账本不动）。"""
-import os, re, sys, json, time, html, argparse, statistics, unicodedata, datetime as dt
+import os, re, sys, json, time, html, uuid, argparse, statistics, unicodedata, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -45,6 +45,13 @@ DOH = 'https://dns.google/resolve?name={}&type=NS'
 FINDNEWS = os.environ.get('FINDNEWS_GAMES_URL', 'https://findnews.me/data/games.json')
 STORE = 'https://store.steampowered.com/app/{}/'
 STEAMDB = 'https://steamdb.info/app/{}/'
+RBX_SORTS = 'https://apis.roblox.com/explore-api/v1/get-sorts?device=computer&country=all&sessionId={}'
+RBX_CONTENT = 'https://apis.roblox.com/explore-api/v1/get-sort-content?sessionId={}&sortId={}'
+RBX_GAMES = 'https://games.roblox.com/v1/games?universeIds={}'
+RBX_VOTES = 'https://games.roblox.com/v1/games/votes?universeIds={}'
+RBX_URL = 'https://www.roblox.com/games/{}/'
+RBX_CHARTS = ('up-and-coming', 'top-trending')
+RBX_WIKI_KW = ('simulator', 'defense', 'anime', 'rng', 'tycoon', 'rpg', 'codes', 'discord.gg')
 
 DETAILS_TTL_H = 72     # 商店详情缓存多久
 GUIDE_WORDS = ('guide', 'guides', 'wiki', 'codes', 'code', 'map', 'recipe', 'recipes', 'build', 'builds', 'tier list',
@@ -180,12 +187,13 @@ def details(net, appid):
     d, rd = d.get('data') or {}, (d.get('data') or {}).get('release_date') or {}
     rel = parse_date(rd.get('date'))
     price = (d.get('price_overview') or {}).get('final_formatted') or ('免费' if d.get('is_free') else '')
+    descriptor_ids = set((d.get('content_descriptors') or {}).get('ids') or [])
     return dict(type=d.get('type') or '', name=d.get('name') or '', release=rel.isoformat() if rel else None,
                 release_raw=rd.get('date') or '', demos=[str(x['appid']) for x in d.get('demos') or [] if x.get('appid')],
                 developers=d.get('developers') or [], publishers=d.get('publishers') or [], price=price,
                 genres=[g.get('description') for g in d.get('genres') or []],
                 english='English' in (d.get('supported_languages') or ''),
-                reviews_total=(d.get('recommendations') or {}).get('total'))
+                reviews_total=(d.get('recommendations') or {}).get('total'), nsfw=bool({3, 4} & descriptor_ids))
 
 
 def players(net, appid):
@@ -228,9 +236,17 @@ def review_texts(net, appid):
     en = [r for r in rs if r.get('language') == 'english']
     hours = [(r.get('author') or {}).get('playtime_at_review', 0) / 60 for r in rs]
     share = lambda ws: round(100 * sum(1 for r in en if has_word((r.get('review') or '').lower(), ws)) / len(en)) if en else None
-    sample = lambda up: [dict(votes=r.get('votes_up', 0), hours=round((r.get('author') or {}).get('playtime_at_review', 0) / 60, 1),
-                              text=re.sub(r'\s+', ' ', r.get('review') or '')[:400])
-                         for r in sorted((r for r in en if bool(r.get('voted_up')) == up), key=lambda r: -r.get('votes_up', 0))[:12]]
+
+    def sample(up):
+        pool = [r for r in en if bool(r.get('voted_up')) == up]
+        quality = [r for r in pool if len((r.get('review') or '').strip()) >= 100
+                   and (r.get('votes_funny') or 0) <= (r.get('votes_up') or 0)]
+        ranked = sorted(quality or pool, key=lambda r: -(r.get('votes_up') or 0))
+        return [dict(votes=r.get('votes_up') or 0,
+                     hours=round(((r.get('author') or {}).get('playtime_at_review') or 0) / 60, 1),
+                     text=re.sub(r'\s+', ' ', r.get('review') or '')[:400])
+                for r in ranked[:12]]
+
     return dict(n=len(rs), english_share=round(100 * len(en) / len(rs)) if rs else None,
                 playtime_median_h=round(statistics.median(hours), 1) if hours else None,
                 guide_share=share(REVIEW_GUIDE), perf_share=share(REVIEW_PERF), positive=sample(True), negative=sample(False))
@@ -293,6 +309,132 @@ def domains(net, name, flags):
     return [check_domain(net, d, flags) for d in wiki_domains(name)]
 
 
+# ---------- Roblox ----------
+
+def clean_roblox_name(name):
+    """去掉 Roblox 标题里的更新标签、活动标记和 Emoji。"""
+    s = re.sub(r'\[[^\]]*\]|\([^)]*\)|【[^】]*】', ' ', unicodedata.normalize('NFKC', name or ''))
+    s = ''.join(' ' if unicodedata.category(c) in ('So', 'Sk', 'Cf') or c in '\ufe0f\u20e3' else c for c in s)
+    s = re.sub(r'\b(upd|update|new|beta|alpha|event|release|codes)\b\s*\d*', ' ', s, flags=re.I)
+    return ' '.join(s.split()).strip(' -–—|:!') or name or ''
+
+
+def roblox_rows(net, url, label, field):
+    data = net.json(url, label)
+    if isinstance(data, dict) and isinstance(data.get(field), list):
+        return [row for row in data[field] if isinstance(row, dict)]
+    if data is not None:
+        net.log.append(f'{label}: 缺少 {field} 列表')
+    return None
+
+
+def fetch_roblox(net, o, state, now, flags):
+    """抓 Roblox 新星/飙升榜，按创建时间、在线人数和好评率筛选。"""
+    sid = uuid.uuid4().hex
+    sorts = roblox_rows(net, RBX_SORTS.format(sid), 'Roblox 榜单列表', 'sorts')
+    if sorts is None:
+        return [], False
+    available = {row.get('sortId') for row in sorts if isinstance(row.get('sortId'), str)}
+    complete = True
+    ids = {}
+    for sort_id in RBX_CHARTS:
+        if sort_id not in available:
+            net.log.append(f'Roblox 榜单列表: 缺少 {sort_id}')
+            complete = False
+            continue
+        rows = roblox_rows(net, RBX_CONTENT.format(sid, sort_id), f'Roblox 榜单 {sort_id}', 'games')
+        if rows is None:
+            complete = False
+            continue
+        ids.update((str(row['universeId']), None) for row in rows if row.get('universeId'))
+
+    games, votes = {}, {}
+    uids = list(ids)
+    for offset in range(0, len(uids), 50):
+        batch_ids = uids[offset:offset + 50]
+        batch = ','.join(batch_ids)
+        for target, url, label in ((games, RBX_GAMES, '详情'), (votes, RBX_VOTES, '投票')):
+            rows = roblox_rows(net, url.format(batch), f'Roblox {label}批次 {offset // 50 + 1}', 'data')
+            target.update((str(row['id']), row) for row in rows or [] if row.get('id'))
+            missing = set(batch_ids) - target.keys()
+            if missing:
+                if rows is not None:
+                    net.log.append(f'Roblox {label}批次 {offset // 50 + 1}: 缺少 {len(missing)} 条记录')
+                complete = False
+        if offset + 50 < len(uids):
+            net.sleep(0.5)
+
+    ledger = state['roblox']
+    stamp = now.isoformat(timespec='minutes')
+    max_days = getattr(o, 'roblox_max_days', 14)
+    min_ccu = getattr(o, 'roblox_min_ccu', 500)
+    max_ccu = getattr(o, 'roblox_max_ccu', 15000)
+    min_like = getattr(o, 'roblox_min_like', 85)
+    candidates = []
+    for uid in uids:
+        prev = ledger.get(uid, {})
+        game = games.get(uid, {})
+        ccu = game.get('playing')
+        ledger[uid] = dict(prev, name=game.get('name') or prev.get('name', ''), last_seen=stamp,
+                           first_seen=prev.get('first_seen') or stamp)
+        if not isinstance(ccu, int):
+            continue
+        prev_ccu = prev.get('last_ccu')
+        # 投票接口失败时保留上次基线，以便下轮可以重试本轮的增长信号。
+        if uid in votes or prev.get('status') == 'pushed':
+            ledger[uid]['last_ccu'] = ccu
+        if prev.get('status') == 'pushed' or not min_ccu <= ccu <= max_ccu:
+            continue
+        created = parse_iso(game.get('created'))
+        if created is None or created.tzinfo is None or created > now or not game.get('rootPlaceId'):
+            continue
+        age_days = (now - created).days
+        if age_days > max_days:
+            continue
+
+        vote = votes.get(uid, {})
+        up, down = vote.get('upVotes') or 0, vote.get('downVotes') or 0
+        total = up + down
+        if total < 100 or 100 * up < min_like * total:
+            continue
+        growth = 100 * (ccu - prev_ccu) / prev_ccu if prev_ccu and prev_ccu > 0 else None
+        if (growth is None and ccu < max(1000, min_ccu)) or (growth is not None and growth < 20):
+            continue
+
+        name = game.get('name') or ''
+        clean_name = clean_roblox_name(name)
+        if not clean_name:
+            continue
+        desc = game.get('description') or ''
+        community_links = re.findall(
+            r'(?i)\b(?:https?://)?(?:www\.)?(?:discord\.gg/|discord\.com/invite/|trello\.com/)[^\s<>]+', desc)
+        candidates.append(dict(uid=uid, place_id=game['rootPlaceId'], name=name, clean_name=clean_name,
+                               age_days=age_days, ccu=ccu, prev_ccu=prev_ccu,
+                               growth=round(growth, 1) if growth is not None else None,
+                               like_ratio=round(100 * up / total), total_votes=total,
+                               wiki_potential=any(k in f'{name} {desc}'.lower() for k in RBX_WIKI_KW),
+                               has_community=bool(community_links), community_links=list(dict.fromkeys(community_links))))
+
+    candidates.sort(key=lambda x: (not x['wiki_potential'], not x['has_community'], -x['ccu']))
+    top = candidates[:10]
+
+    def enrich(candidate):
+        candidate['suggest'] = suggest(net, candidate['clean_name'])
+        candidate['domains'] = domains(net, candidate['clean_name'], flags)
+
+    pmap(enrich, top, 4)
+    for candidate in top:
+        ledger[candidate['uid']].update(status='pushed', pushed_at=stamp)
+
+    if complete:
+        cutoff = now - dt.timedelta(days=14)
+        for uid, record in list(ledger.items()):
+            seen = parse_iso(record.get('last_seen'))
+            if record.get('status') != 'pushed' and (seen is None or seen.tzinfo is None or seen < cutoff):
+                del ledger[uid]
+    return top, complete
+
+
 # ---------- 状态 ----------
 
 def load_json(p, default):
@@ -311,8 +453,12 @@ def save_json(p, obj):
 def load_state():
     s = load_json(STATEF, {})
     if not isinstance(s, dict): s = {}
-    if 'apps' not in s and 'findnews' not in s: s = dict(findnews=s)   # 旧版账本只有 FindNews 的游戏
-    s.setdefault('apps', {}); s.setdefault('findnews', {})
+    if 'apps' not in s and 'findnews' not in s:
+        # 旧版账本的游戏词可以叫 roblox，新版账本始终有 apps 和 findnews。
+        s = dict(findnews=s)
+    s.setdefault('apps', {})
+    s.setdefault('findnews', {})
+    s.setdefault('roblox', {})
     return s
 
 
@@ -357,7 +503,7 @@ def run(o, net, now):
     # 3. 商店详情（缓存 72 小时）
     def get_details(a):
         c = apps.get(a, {}).get('details')
-        if fresh(c, now, DETAILS_TTL_H): return c
+        if fresh(c, now, DETAILS_TTL_H) and 'nsfw' in c: return c
         net.sleep(o.pace)
         d = details(net, a)
         if d: d['at'] = stamp
@@ -365,12 +511,18 @@ def run(o, net, now):
     dets = dict(zip(need, pmap(get_details, need, 2)))
 
     # 4. 分桶
-    pool = []
+    pool, excluded = [], []
     for a in need:
         e, d = entries[a], dets[a]
         if not d: continue   # 没拿到详情，下轮再试，不记账
         if d['type'] != 'game':
             apps[a] = dict(name=e['name'], status='excluded', reason=f"不是游戏本体（{d['type']}）", first_seen=stamp); continue
+        if d.get('nsfw'):
+            name = d['name'] or e['name']
+            reason = 'Steam 成人内容分级'
+            apps[a] = dict(name=name, status='excluded', reason=reason, first_seen=apps.get(a, {}).get('first_seen', stamp))
+            excluded.append(dict(name=name, reason=reason))
+            continue
         days = days_of(d['release']) if d['release'] else (lambda r: (r - today).days if r else None)(parse_date(e['release_raw']))
         if days is not None and days < -o.max_released_days:
             apps[a] = dict(name=d['name'], status='old', first_seen=stamp); continue
@@ -441,10 +593,15 @@ def run(o, net, now):
             x['suggest'] = suggest(net, x['name']); x['domains'] = domains(net, x['name'], flags)
         pmap(fn_enrich, fn[:10], 4)
 
+    roblox, roblox_ok = [], None
+    if not getattr(o, 'no_roblox', True):
+        roblox, roblox_ok = fetch_roblox(net, o, state, now, flags)
+
     res = dict(at=now.strftime('%Y-%m-%d %H:%M'), feed_ok=feed_ok, sources_ok=src_ok, sources_err=src_err,
                rdap_blocked=flags.get('rdap'), over_budget=net.over, findnews_ok=fn_ok, log=log,
                min_demo=o.min_demo, candidates=cands, deferred=[slim(c) for c in deferred],
-               watch=[slim(c) for c in watch[:15]], watch_total=len(watch), rechecks=rechecks, findnews=fn)
+               watch=[slim(c) for c in watch[:15]], watch_total=len(watch), rechecks=rechecks, findnews=fn,
+               roblox=roblox, roblox_ok=roblox_ok, excluded=excluded)
     out = out_dir(now, o.slot)
     save_json(os.path.join(out, 'games.json'), res)
     md = render(res)
@@ -563,20 +720,48 @@ def comp_line(ds):
     return s + '；竞品站内容深度待查'
 
 
+def roblox_lines(res):
+    lines = ['', '五、Roblox 飙升新游（快闪 Wiki 候选）']
+    candidates = res.get('roblox') or []
+    if not candidates:
+        status = res.get('roblox_ok')
+        lines.append({True: '无', False: '数据不全，无法判断', None: '本轮未采集'}[status])
+    for game in candidates:
+        tags = []
+        if game['wiki_potential']: tags.append('高 Wiki 潜质')
+        if game['has_community']: tags.append('简介有 Discord/Trello 线索')
+        tag = f"[{' · '.join(tags)}] " if tags else ''
+        growth = game['growth']
+        change = f'（较上轮 +{growth:g}%）' if growth is not None else '（无可比的在线人数快照）'
+        lines += ['', f"**{tag}{game['name']}**", '',
+                  f"- 阶段：创建 {game['age_days']} 天（清洗词根：{game['clean_name']}）",
+                  f"- 热度：在线 {game['ccu']:,} 人{change}；好评 {game['like_ratio']}%（{game['total_votes']:,} 票）",
+                  '- 轻量舆情：待检（YouTube 近 7 天视频和评论区、官方社区）',
+                  search_line(game.get('suggest')),
+                  comp_line(game.get('domains')),
+                  f"- 链接：{RBX_URL.format(game['place_id'])}"]
+    return lines
+
+
 def render(res):
     L = [f"**游戏新词雷达 · {res['at']}**",
-         f"新游戏 {len(res['candidates'])} · 复查 {len(res['rechecks'])} · 早期观察 {res['watch_total']} · FindNews 补充 {len(res['findnews'])}"]
+         f"新游戏 {len(res['candidates'])} · 复查 {len(res['rechecks'])} · 早期观察 {res['watch_total']} · "
+         f"FindNews 补充 {len(res['findnews'])} · Roblox 新游 {len(res.get('roblox') or [])}"]
     if not res['feed_ok']:
         L += ['', '⚠ 这轮 Steam 榜单全部没拿到，不代表没有新游戏：' + '；'.join(res['log'][:6])]
-        return '\n'.join(L) + '\n'
     warn = []
-    if res['sources_err']: warn.append(f"Steam 榜单没拿到：{'、'.join(res['sources_err'])}，这部分游戏可能漏掉")
+    if res['feed_ok'] and res['sources_err']: warn.append(f"Steam 榜单没拿到：{'、'.join(res['sources_err'])}，这部分游戏可能漏掉")
     if any(c.get('reviews') is None and c['days'] is not None and c['days'] <= 0 for c in res['candidates']):
         warn.append('Steam 评测原文接口没拿到（当前网络被重定向或拦截），评测只有数量和好评率')
     if res['rdap_blocked']: warn.append(f"RDAP 查域名被拒（{res['rdap_blocked']}），改用 DNS 判断，没有注册日期")
     if res['over_budget']: warn.append('超过本轮时间上限，部分数据没查')
     if res['findnews_ok'] is False: warn.append('FindNews 没拿到，补充线索缺失')
+    if res.get('roblox_ok') is False: warn.append('Roblox 榜单、详情或投票数据未完整取得，候选可能有遗漏')
     L += [''] + [f'⚠ {w}' for w in warn] if warn else []
+    if not res['feed_ok']:
+        if res.get('roblox_ok') is not None:
+            L += roblox_lines(res)
+        return '\n'.join(L) + '\n'
 
     L += ['', '一、新游戏']
     if not res['candidates']: L.append('无')
@@ -628,7 +813,9 @@ def render(res):
         L.append(f"- {x['name']}：" + '，'.join(bits))
     if len(res['findnews']) > 10: L.append(f"- 另有 {len(res['findnews']) - 10} 个 score 更低的，见 games.json")
 
-    L += ['', '五、没推的', '无']
+    L += roblox_lines(res)
+    L += ['', '六、没推的']
+    L += [f"- {item['name']}：{item['reason']}" for item in res.get('excluded', [])] or ['无']
     return '\n'.join(L) + '\n'
 
 
@@ -639,17 +826,23 @@ def main():
     ap.add_argument('--pre-days', type=int, default=env('RADAR_PRE_DAYS', 14), help='几天内发售的直接进新游戏')
     ap.add_argument('--early-days', type=int, default=env('RADAR_EARLY_DAYS', 49), help='几天内发售的看试玩版热度')
     ap.add_argument('--max-released-days', type=int, default=env('RADAR_MAX_RELEASED_DAYS', 14), help='已发售超过几天算老词')
-    ap.add_argument('--min-demo', type=int, default=env('RADAR_MIN_DEMO', 500), help='试玩版在线人数门槛')
+    ap.add_argument('--min-demo', type=int, default=env('RADAR_MIN_DEMO', 250), help='试玩版在线人数门槛')
     ap.add_argument('--max-new', type=int, default=env('RADAR_MAX_NEW', 15), help='一轮最多展开几个新游戏')
     ap.add_argument('--budget', type=int, default=600, help='一轮最多跑几秒')
     ap.add_argument('--pace', type=float, default=0.4, help='商店详情接口每次请求间隔几秒')
     ap.add_argument('--no-findnews', action='store_true', help='不抓 FindNews')
+    ap.add_argument('--no-roblox', action='store_true', help='不抓 Roblox')
+    ap.add_argument('--roblox-max-days', type=int, default=env('RADAR_RBX_DAYS', 14), help='Roblox 新游创建天数上限')
+    ap.add_argument('--roblox-min-ccu', type=int, default=env('RADAR_RBX_MIN_CCU', 500), help='Roblox 最低在线人数')
+    ap.add_argument('--roblox-max-ccu', type=int, default=env('RADAR_RBX_MAX_CCU', 15000), help='Roblox 最高在线人数')
+    ap.add_argument('--roblox-min-like', type=int, default=env('RADAR_RBX_MIN_LIKE', 85), help='Roblox 最低好评率（百分比）')
     ap.add_argument('--no-save', action='store_true', help='试跑：不写账本')
     o = ap.parse_args()
     log = []
     code, res, _, out = run(o, Net(log, budget=o.budget), dt.datetime.now(TZ))
     print(f"radar: feed_ok={res['feed_ok']}，新游戏 {len(res['candidates'])}，复查 {len(res['rechecks'])}，"
-          f"早期观察 {res['watch_total']}，FindNews 补充 {len(res['findnews'])}" + ('（试跑，没写账本）' if o.no_save else ''))
+          f"早期观察 {res['watch_total']}，FindNews 补充 {len(res['findnews'])}，Roblox 新游 {len(res['roblox'])}"
+          + ('（试跑，没写账本）' if o.no_save else ''))
     print('结果：' + out)
     for l in log[:40]: print(' ', l)
     if len(log) > 40: print(f'  …… 另有 {len(log) - 40} 条，见 games.json 的 log')

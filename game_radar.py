@@ -328,8 +328,21 @@ def roblox_rows(net, url, label, field):
     return None
 
 
+def ccu_baseline(hist, now, lo=20, hi=28):
+    """约 24 小时前（同一时段）的在线人数。早报和晚报正好隔着美国的高峰和低谷，跟上一轮比会得到假涨跌。"""
+    best = None
+    for t, v in hist or []:
+        ts = parse_iso(t)
+        if ts is None or ts.tzinfo is None or not isinstance(v, int): continue
+        h = (now - ts).total_seconds() / 3600
+        if lo <= h <= hi and (best is None or abs(h - 24) < abs(best[0] - 24)): best = (h, v)
+    return best[1] if best else None
+
+
 def fetch_roblox(net, o, state, now, flags):
-    """抓 Roblox 新星/飙升榜，按创建时间、在线人数和好评率筛选。"""
+    """抓 Roblox 新星/飙升榜。看的是在线人数暴涨的时间点，不是创建日期：
+    创建 ≤ --roblox-new-days 天的新游，在线够多或比 24 小时前涨 20% 就收；
+    更早创建的（≤ --roblox-max-days 天），要比 24 小时前涨 ≥ --roblox-spike% 才收（第一次见到只记基线）。"""
     sid = uuid.uuid4().hex
     sorts = roblox_rows(net, RBX_SORTS.format(sid), 'Roblox 榜单列表', 'sorts')
     if sorts is None:
@@ -366,7 +379,9 @@ def fetch_roblox(net, o, state, now, flags):
 
     ledger = state['roblox']
     stamp = now.isoformat(timespec='minutes')
-    max_days = getattr(o, 'roblox_max_days', 14)
+    max_days = getattr(o, 'roblox_max_days', 90)
+    new_days = getattr(o, 'roblox_new_days', 14)
+    spike = getattr(o, 'roblox_spike', 50)
     min_ccu = getattr(o, 'roblox_min_ccu', 500)
     max_ccu = getattr(o, 'roblox_max_ccu', 15000)
     min_like = getattr(o, 'roblox_min_like', 85)
@@ -379,10 +394,13 @@ def fetch_roblox(net, o, state, now, flags):
                            first_seen=prev.get('first_seen') or stamp)
         if not isinstance(ccu, int):
             continue
-        prev_ccu = prev.get('last_ccu')
-        # 投票接口失败时保留上次基线，以便下轮可以重试本轮的增长信号。
-        if uid in votes or prev.get('status') == 'pushed':
-            ledger[uid]['last_ccu'] = ccu
+        hist = list(prev.get('ccu_hist') or [])
+        if not hist and isinstance(prev.get('last_ccu'), int) and prev.get('last_seen'):
+            hist = [[prev['last_seen'], prev['last_ccu']]]   # 旧版账本只存了上一轮的数
+        prev_ccu = ccu_baseline(hist, now)
+        hist = [x for x in hist if (lambda t: t is not None and t.tzinfo and (now - t).days < 3)(parse_iso(x[0]))]
+        ledger[uid]['ccu_hist'] = (hist + [[stamp, ccu]])[-8:]
+        ledger[uid].pop('last_ccu', None)
         if prev.get('status') == 'pushed' or not min_ccu <= ccu <= max_ccu:
             continue
         created = parse_iso(game.get('created'))
@@ -398,8 +416,11 @@ def fetch_roblox(net, o, state, now, flags):
         if total < 100 or 100 * up < min_like * total:
             continue
         growth = 100 * (ccu - prev_ccu) / prev_ccu if prev_ccu and prev_ccu > 0 else None
-        if (growth is None and ccu < max(1000, min_ccu)) or (growth is not None and growth < 20):
-            continue
+        if age_days <= new_days:
+            if (growth is None and ccu < max(1000, min_ccu)) or (growth is not None and growth < 20):
+                continue
+        elif growth is None or growth < spike:
+            continue   # 老游戏：没有 24 小时前的基线（第一次见到）或涨得不够，不算暴涨
 
         name = game.get('name') or ''
         clean_name = clean_roblox_name(name)
@@ -409,7 +430,7 @@ def fetch_roblox(net, o, state, now, flags):
         community_links = re.findall(
             r'(?i)\b(?:https?://)?(?:www\.)?(?:discord\.gg/|discord\.com/invite/|trello\.com/)[^\s<>]+', desc)
         candidates.append(dict(uid=uid, place_id=game['rootPlaceId'], name=name, clean_name=clean_name,
-                               age_days=age_days, ccu=ccu, prev_ccu=prev_ccu,
+                               age_days=age_days, kind='新游' if age_days <= new_days else '老游戏暴涨', ccu=ccu, prev_ccu=prev_ccu,
                                growth=round(growth, 1) if growth is not None else None,
                                like_ratio=round(100 * up / total), total_votes=total,
                                wiki_potential=any(k in f'{name} {desc}'.lower() for k in RBX_WIKI_KW),
@@ -732,9 +753,10 @@ def roblox_lines(res):
         if game['has_community']: tags.append('简介有 Discord/Trello 线索')
         tag = f"[{' · '.join(tags)}] " if tags else ''
         growth = game['growth']
-        change = f'（较上轮 +{growth:g}%）' if growth is not None else '（无可比的在线人数快照）'
+        change = (f"（24 小时前 {game['prev_ccu']:,} 人，{growth:+g}%）" if growth is not None
+                  else '（没有 24 小时前的数据）')
         lines += ['', f"**{tag}{game['name']}**", '',
-                  f"- 阶段：创建 {game['age_days']} 天（清洗词根：{game['clean_name']}）",
+                  f"- 阶段：创建 {game['age_days']} 天 · {game.get('kind', '新游')}（清洗词根：{game['clean_name']}）",
                   f"- 热度：在线 {game['ccu']:,} 人{change}；好评 {game['like_ratio']}%（{game['total_votes']:,} 票）",
                   '- 轻量舆情：待检（YouTube 近 7 天视频和评论区、官方社区）',
                   search_line(game.get('suggest')),
@@ -832,7 +854,9 @@ def main():
     ap.add_argument('--pace', type=float, default=0.4, help='商店详情接口每次请求间隔几秒')
     ap.add_argument('--no-findnews', action='store_true', help='不抓 FindNews')
     ap.add_argument('--no-roblox', action='store_true', help='不抓 Roblox')
-    ap.add_argument('--roblox-max-days', type=int, default=env('RADAR_RBX_DAYS', 14), help='Roblox 新游创建天数上限')
+    ap.add_argument('--roblox-new-days', type=int, default=env('RADAR_RBX_NEW_DAYS', 14), help='Roblox 创建几天内算新游')
+    ap.add_argument('--roblox-max-days', type=int, default=env('RADAR_RBX_DAYS', 90), help='Roblox 创建超过几天不看')
+    ap.add_argument('--roblox-spike', type=int, default=env('RADAR_RBX_SPIKE', 50), help='老游戏比 24 小时前涨多少百分比算暴涨')
     ap.add_argument('--roblox-min-ccu', type=int, default=env('RADAR_RBX_MIN_CCU', 500), help='Roblox 最低在线人数')
     ap.add_argument('--roblox-max-ccu', type=int, default=env('RADAR_RBX_MAX_CCU', 15000), help='Roblox 最高在线人数')
     ap.add_argument('--roblox-min-like', type=int, default=env('RADAR_RBX_MIN_LIKE', 85), help='Roblox 最低好评率（百分比）')

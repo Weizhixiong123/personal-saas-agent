@@ -238,5 +238,62 @@ class Parsing(unittest.TestCase):
         self.assertIsNone(self.g.parse_date('Coming soon'))
 
 
+def roblox_routes(ccu):
+    """ccu: {universeId: 在线人数}；创建天数固定：1=5 天，2、3=40 天，4=200 天。"""
+    age = {1: 5, 2: 40, 3: 40, 4: 200}
+    names = {1: 'Pet RNG [UPD 2]', 2: 'Old Spike Tycoon', 3: 'Old Steady Simulator', 4: 'Ancient Defense'}
+    games = [dict(id=u, name=names[u], playing=ccu[u], rootPlaceId=u * 100, description='discord.gg/abc',
+                  created=(NOW - dt.timedelta(days=age[u])).isoformat()) for u in ccu]
+    return {
+        'get-sorts': (200, json.dumps(dict(sorts=[dict(sortId='up-and-coming'), dict(sortId='top-trending')]))),
+        'get-sort-content': (200, json.dumps(dict(games=[dict(universeId=u) for u in ccu]))),
+        'games/votes': (200, json.dumps(dict(data=[dict(id=u, upVotes=950, downVotes=50) for u in ccu]))),
+        'v1/games?universeIds': (200, json.dumps(dict(data=games))),
+    }
+
+
+class Roblox(unittest.TestCase):
+    def setUp(self):
+        import game_radar
+        self.g = game_radar
+        self.state = dict(apps={}, findnews={}, roblox={})
+
+    def run_at(self, ccu, hours=0):
+        o = argparse.Namespace(roblox_new_days=14, roblox_max_days=90, roblox_spike=50, roblox_min_ccu=500,
+                               roblox_max_ccu=15000, roblox_min_like=85)
+        net = self.g.Net([], fetch=Fake(roblox_routes(ccu)), sleep=lambda s: None)
+        got, ok = self.g.fetch_roblox(net, o, self.state, NOW + dt.timedelta(hours=hours), {})
+        self.assertTrue(ok)
+        return {c['name']: c for c in got}
+
+    def test_new_game_first_sight(self):
+        got = self.run_at({1: 3000, 2: 3000, 3: 4000, 4: 3000})
+        self.assertEqual(list(got), ['Pet RNG [UPD 2]'])           # 老游戏第一次见到只记基线
+        self.assertEqual(got['Pet RNG [UPD 2]']['kind'], '新游')
+        self.assertEqual(got['Pet RNG [UPD 2]']['clean_name'], 'Pet RNG')
+
+    def test_old_game_spike_vs_24h(self):
+        self.run_at({1: 3000, 2: 3000, 3: 4000, 4: 3000})
+        got = self.run_at({1: 3000, 2: 6000, 3: 4400, 4: 9000}, hours=24)
+        self.assertEqual(list(got), ['Old Spike Tycoon'])          # 创建 40 天，+100%；+10% 的不算；200 天的不看
+        c = got['Old Spike Tycoon']
+        self.assertEqual((c['kind'], c['prev_ccu'], c['growth']), ('老游戏暴涨', 3000, 100.0))
+        md = '\n'.join(self.g.roblox_lines(dict(roblox=list(got.values()), roblox_ok=True)))
+        self.assertIn('创建 41 天 · 老游戏暴涨', md)               # 第二轮在 24 小时后
+        self.assertIn('24 小时前 3,000 人，+100%', md)
+
+    def test_half_day_swing_is_not_spike(self):
+        self.run_at({1: 3000, 2: 3000, 3: 4000, 4: 3000})
+        got = self.run_at({1: 3000, 2: 9000, 3: 4000, 4: 3000}, hours=12)
+        self.assertEqual(got, {})                                  # 早晚报之间的时差波动，不跟 12 小时前比
+
+    def test_old_ledger_last_ccu_migrates(self):
+        seen = (NOW - dt.timedelta(hours=24)).isoformat(timespec='minutes')
+        self.state['roblox']['2'] = dict(name='Old Spike Tycoon', last_ccu=2000, last_seen=seen)
+        got = self.run_at({2: 5000})
+        self.assertEqual(got['Old Spike Tycoon']['prev_ccu'], 2000)
+        self.assertNotIn('last_ccu', self.state['roblox']['2'])
+
+
 if __name__ == '__main__':
     unittest.main()

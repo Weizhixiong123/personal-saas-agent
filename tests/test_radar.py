@@ -295,5 +295,74 @@ class Roblox(unittest.TestCase):
         self.assertNotIn('last_ccu', self.state['roblox']['2'])
 
 
+def chart_routes(spec, rdap=None):
+    """spec: {universeId: (名字, 创建天数, 在线人数, 所在榜单)}；rdap: {域名: 几天前注册}。"""
+    games = [dict(id=u, name=n, playing=c, rootPlaceId=u * 100, description='',
+                  created=(NOW - dt.timedelta(days=a)).isoformat()) for u, (n, a, c, _) in spec.items()]
+    sort = lambda sid: (200, json.dumps(dict(games=[dict(universeId=u) for u, v in spec.items() if sid in v[3]])))
+    r = {
+        'get-sorts': (200, json.dumps(dict(sorts=[dict(sortId='up-and-coming'), dict(sortId='top-trending')]))),
+        'sortId=up-and-coming': sort('up-and-coming'),
+        'sortId=top-trending': sort('top-trending'),
+        'games/votes': (200, json.dumps(dict(data=[dict(id=u, upVotes=950, downVotes=50) for u in spec]))),
+        'v1/games?universeIds': (200, json.dumps(dict(data=games))),
+    }
+    for d, ago in (rdap or {}).items():
+        when = (NOW - dt.timedelta(days=ago)).astimezone(dt.timezone.utc).isoformat()
+        r[f'rdap.nic.wiki/domain/{d}'] = (200, json.dumps(dict(events=[dict(eventAction='registration', eventDate=when)])))
+    return r
+
+
+class RobloxTiming(unittest.TestCase):
+    def setUp(self):
+        import game_radar
+        self.g = game_radar
+
+    def test_timing_order_and_skip(self):
+        UC, TT = ('up-and-coming',), ('up-and-coming', 'top-trending')
+        spec = {1: ('Pet RNG', 5, 3000, UC), 2: ('Seed Farm', 5, 3000, TT), 3: ('Taken Tycoon', 5, 3000, UC),
+                4: ('Fresh Grab Sim', 5, 3000, UC), 5: ('Ragdoll Lab', 5, 3000, UC), 6: ('Too Big Sim', 5, 50000, UC),
+                7: ('Defeat Ragdolls for Powers', 5, 3000, UC), 8: ('Realistic Plane Crashing', 5, 3000, UC)}
+        rdap = {'takentycoon.wiki': 5, 'freshgrabsim.wiki': 1}
+        net = self.g.Net([], fetch=Fake(chart_routes(spec, rdap)), sleep=lambda s: None)
+        state = dict(apps={}, findnews={}, roblox={})
+        got, ok = self.g.fetch_roblox(net, argparse.Namespace(), state, NOW, {})
+        self.assertTrue(ok)
+        # 🟢 只在新星榜 → 🟢 两个榜都有 → 🟡 刚被注册 → 🔴 早被注册；Ragdoll 和在线 5 万的不收
+        self.assertEqual([(c['name'], c['timing']) for c in got],
+                         [('Pet RNG', 'green'), ('Seed Farm', 'green'), ('Fresh Grab Sim', 'yellow'), ('Taken Tycoon', 'red')])
+        md = '\n'.join(self.g.roblox_lines(dict(roblox=got, roblox_ok=True)))
+        self.assertIn('**🟢 [高 Wiki 潜质] Pet RNG**', md)
+        self.assertIn('只在新星榜，还没进飙升榜', md)
+        self.assertIn('新星榜和飙升榜都有', md)
+        self.assertIn('freshgrabsim.wiki 已被注册，最早', md)
+        self.assertIn('（1 天前），竞品刚到', md)
+        self.assertIn('（5 天前），晚了', md)
+
+    def test_domain_timing(self):
+        t = dt.date(2026, 11, 20)
+        f = lambda d, reg, created=None: dict(domain=d, registered=reg, created=created)
+        self.assertEqual(self.g.domain_timing([f('a.wiki', False), f('a-b.wiki', False)], t)[0], 'green')
+        self.assertEqual(self.g.domain_timing([f('a.wiki', False), f('a-b.wiki', True, '2026-11-17')], t)[0], 'yellow')
+        self.assertEqual(self.g.domain_timing([f('a.wiki', True, '2026-11-16')], t)[0], 'red')
+        self.assertEqual(self.g.domain_timing([f('a.wiki', True)], t)[0], 'unknown')       # DNS 判断，没有日期
+        self.assertEqual(self.g.domain_timing([f('a.wiki', None)], t)[0], 'unknown')
+        self.assertEqual(self.g.domain_timing([], t)[0], 'unknown')                         # 名字不是英文
+        self.assertEqual(self.g.primary_domains('Hades'), ['hades.wiki'])
+
+    def test_rdap_transient_error_keeps_rdap(self):
+        calls = []
+        def fetch(url, timeout):
+            calls.append(url)
+            if 'rdap' in url and 'a.wiki' in url and len(calls) == 1: raise OSError('SSL EOF')
+            if 'rdap' in url: return 404, ''
+            return 200, json.dumps(dict(Status=3))
+        net, flags = self.g.Net([], fetch=fetch, sleep=lambda s: None), {}
+        self.assertEqual(self.g.check_domain(net, 'a.wiki', flags)['via'], 'dns')    # 这一个改用 DNS
+        self.assertNotIn('rdap', flags)                                              # 但不整轮停用
+        self.assertEqual(self.g.check_domain(net, 'b.wiki', flags)['via'], 'rdap')
+        self.assertEqual(self.g.primary_domains('Prison Tycoon'), ['prisontycoon.wiki', 'prison-tycoon.wiki'])
+
+
 if __name__ == '__main__':
     unittest.main()

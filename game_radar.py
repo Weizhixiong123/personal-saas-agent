@@ -51,7 +51,12 @@ RBX_GAMES = 'https://games.roblox.com/v1/games?universeIds={}'
 RBX_VOTES = 'https://games.roblox.com/v1/games/votes?universeIds={}'
 RBX_URL = 'https://www.roblox.com/games/{}/'
 RBX_CHARTS = ('up-and-coming', 'top-trending')
-RBX_WIKI_KW = ('simulator', 'defense', 'anime', 'rng', 'tycoon', 'rpg', 'codes', 'discord.gg')
+RBX_WIKI_KW = ('simulator', 'defense', 'anime', 'rng', 'tycoon', 'rpg', 'codes', 'discord.gg', 'evolution', 'idle',
+               'upgrade', 'incremental', 'merge', 'collect', 'pets', 'grow', 'farm', 'factory', 'tower', 'units', 'craft')
+RBX_SKIP_KW = ('ragdoll', 'obby', 'physics', 'chess', 'sandbox', 'plane crash', 'guess', 'hangout', 'dress up',
+               'ffa', 'pvp')   # 只看游戏名：纯物理、跑酷、社交、对战，没有能做成页面的数据
+RBX_UC, RBX_TT = 'up-and-coming', 'top-trending'
+TIMING = {'green': ('🟢', 0), 'yellow': ('🟡', 1), 'unknown': ('⚪', 2), 'red': ('🔴', 3)}
 
 DETAILS_TTL_H = 72     # 商店详情缓存多久
 GUIDE_WORDS = ('guide', 'guides', 'wiki', 'codes', 'code', 'map', 'recipe', 'recipes', 'build', 'builds', 'tier list',
@@ -294,7 +299,7 @@ def check_domain(net, d, flags):
             try: ev = {e.get('eventAction'): (e.get('eventDate') or '')[:10] for e in json.loads(body).get('events') or []}
             except ValueError: ev = {}
             return dict(domain=d, registered=True, created=ev.get('registration'), via='rdap')
-        flags['rdap'] = f'http {st}' if st else body
+        if st in (403, 429): flags['rdap'] = f'http {st}'   # 被限额才整轮停用；偶发网络错误只这一个改用 DNS
     st, body = net.get(DOH.format(d))
     if st == 200:
         try:
@@ -339,17 +344,44 @@ def ccu_baseline(hist, now, lo=20, hi=28):
     return best[1] if best else None
 
 
+def primary_domains(name):
+    """竞品最先抢的两个：游戏名.wiki、游戏-名.wiki。"""
+    t = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode().lower()
+    words = re.findall(r'[a-z0-9]+', re.sub(r"['’]", '', t))
+    return list(dict.fromkeys([''.join(words) + '.wiki', '-'.join(words) + '.wiki'])) if words else []
+
+
+def domain_timing(results, today, fresh_days=3):
+    """主域名的注册情况 → (green / yellow / red / unknown, 说明)。
+    竞品通常在游戏上榜后 0 到 3 天内把好域名抢完：都空着=窗口开着；最早注册 ≤ 3 天=竞品刚到；更早=晚了。"""
+    reg = [d for d in results if d['registered']]
+    if not reg:
+        if results and all(d['registered'] is False for d in results): return 'green', '主域名都空着，窗口开着'
+        return 'unknown', '主域名没查到'
+    names = '、'.join(d['domain'] for d in reg)
+    dates = sorted(d['created'] for d in reg if d.get('created'))
+    if not dates: return 'unknown', f'{names} 已被注册（没拿到注册日期，打开看看有没有站）'
+    age = (today - dt.date.fromisoformat(dates[0])).days
+    if age <= fresh_days: return 'yellow', f'{names} 已被注册，最早 {dates[0][5:]}（{age} 天前），竞品刚到，要做就当天上线'
+    return 'red', f'{names} 已被注册，最早 {dates[0][5:]}（{age} 天前），晚了，最多做长尾'
+
+
 def fetch_roblox(net, o, state, now, flags):
-    """抓 Roblox 新星/飙升榜。看的是在线人数暴涨的时间点，不是创建日期：
-    创建 ≤ --roblox-new-days 天的新游，在线够多或比 24 小时前涨 20% 就收；
-    更早创建的（≤ --roblox-max-days 天），要比 24 小时前涨 ≥ --roblox-spike% 才收（第一次见到只记基线）。"""
+    """抓 Roblox 新星榜和飙升榜，目标是在竞品注册域名之前找到游戏。
+    1. 只在新星榜、还没进飙升榜的优先（竞品主要盯飙升榜）
+    2. 硬过滤：创建 ≤ --roblox-max-days 天、在线在 --roblox-min-ccu 到 --roblox-max-ccu 之间、
+       好评率 ≥ --roblox-min-like% 且投票 ≥ --roblox-min-votes、游戏名不含 RBX_SKIP_KW
+    3. 势头：创建 ≤ --roblox-new-days 天的新游，在线 ≥ 1000 或比 24 小时前涨 20%；
+       更早的要比 24 小时前涨 ≥ --roblox-spike%（第一次见到只记基线）
+    4. 时机：查 游戏名.wiki、游戏-名.wiki，🟢 都空着 / 🟡 最早注册 ≤ 3 天 / 🔴 更早 / ⚪ 没拿到日期
+    5. 排序：时机 → 只在新星榜优先 → 涨幅 → 玩法有数值深度 → 在线人数"""
     sid = uuid.uuid4().hex
     sorts = roblox_rows(net, RBX_SORTS.format(sid), 'Roblox 榜单列表', 'sorts')
     if sorts is None:
         return [], False
     available = {row.get('sortId') for row in sorts if isinstance(row.get('sortId'), str)}
     complete = True
-    ids = {}
+    ids, charts = {}, {}
     for sort_id in RBX_CHARTS:
         if sort_id not in available:
             net.log.append(f'Roblox 榜单列表: 缺少 {sort_id}')
@@ -359,7 +391,10 @@ def fetch_roblox(net, o, state, now, flags):
         if rows is None:
             complete = False
             continue
-        ids.update((str(row['universeId']), None) for row in rows if row.get('universeId'))
+        for row in rows:
+            if row.get('universeId'):
+                ids[str(row['universeId'])] = None
+                charts.setdefault(str(row['universeId']), set()).add(sort_id)
 
     games, votes = {}, {}
     uids = list(ids)
@@ -379,12 +414,13 @@ def fetch_roblox(net, o, state, now, flags):
 
     ledger = state['roblox']
     stamp = now.isoformat(timespec='minutes')
-    max_days = getattr(o, 'roblox_max_days', 90)
+    max_days = getattr(o, 'roblox_max_days', 60)
     new_days = getattr(o, 'roblox_new_days', 14)
     spike = getattr(o, 'roblox_spike', 50)
-    min_ccu = getattr(o, 'roblox_min_ccu', 500)
-    max_ccu = getattr(o, 'roblox_max_ccu', 15000)
-    min_like = getattr(o, 'roblox_min_like', 85)
+    min_ccu = getattr(o, 'roblox_min_ccu', 300)
+    max_ccu = getattr(o, 'roblox_max_ccu', 10000)
+    min_like = getattr(o, 'roblox_min_like', 80)
+    min_votes = getattr(o, 'roblox_min_votes', 200)
     candidates = []
     for uid in uids:
         prev = ledger.get(uid, {})
@@ -413,7 +449,7 @@ def fetch_roblox(net, o, state, now, flags):
         vote = votes.get(uid, {})
         up, down = vote.get('upVotes') or 0, vote.get('downVotes') or 0
         total = up + down
-        if total < 100 or 100 * up < min_like * total:
+        if total < min_votes or 100 * up < min_like * total:
             continue
         growth = 100 * (ccu - prev_ccu) / prev_ccu if prev_ccu and prev_ccu > 0 else None
         if age_days <= new_days:
@@ -424,7 +460,7 @@ def fetch_roblox(net, o, state, now, flags):
 
         name = game.get('name') or ''
         clean_name = clean_roblox_name(name)
-        if not clean_name:
+        if not clean_name or any(re.search(r'\b' + re.escape(w), clean_name.lower()) for w in RBX_SKIP_KW):   # 词头匹配：ragdolls、plane crashing 也算
             continue
         desc = game.get('description') or ''
         community_links = re.findall(
@@ -434,9 +470,16 @@ def fetch_roblox(net, o, state, now, flags):
                                growth=round(growth, 1) if growth is not None else None,
                                like_ratio=round(100 * up / total), total_votes=total,
                                wiki_potential=any(k in f'{name} {desc}'.lower() for k in RBX_WIKI_KW),
-                               has_community=bool(community_links), community_links=list(dict.fromkeys(community_links))))
+                               has_community=bool(community_links), community_links=list(dict.fromkeys(community_links)),
+                               charts=sorted(charts.get(uid, ())), early=charts.get(uid) == {RBX_UC}))
 
-    candidates.sort(key=lambda x: (not x['wiki_potential'], not x['has_community'], -x['ccu']))
+    # 先只查两个主域名判断时机（便宜），排好序再给前 10 个查全套
+    def timing(c):
+        c['timing'], c['timing_note'] = domain_timing([check_domain(net, d, flags) for d in primary_domains(c['clean_name'])],
+                                                      now.astimezone(TZ).date())
+    pmap(timing, candidates, 4)
+    candidates.sort(key=lambda x: (TIMING[x['timing']][1], not x['early'], -(x['growth'] or 0),
+                                   not x['wiki_potential'], -x['ccu']))
     top = candidates[:10]
 
     def enrich(candidate):
@@ -742,7 +785,7 @@ def comp_line(ds):
 
 
 def roblox_lines(res):
-    lines = ['', '五、Roblox 飙升新游（快闪 Wiki 候选）']
+    lines = ['', '五、Roblox 飙升新游（快闪 Wiki 候选，按时机排：🟢 窗口开着 / 🟡 竞品刚到 / ⚪ 日期不明 / 🔴 晚了）']
     candidates = res.get('roblox') or []
     if not candidates:
         status = res.get('roblox_ok')
@@ -755,8 +798,14 @@ def roblox_lines(res):
         growth = game['growth']
         change = (f"（24 小时前 {game['prev_ccu']:,} 人，{growth:+g}%）" if growth is not None
                   else '（没有 24 小时前的数据）')
-        lines += ['', f"**{tag}{game['name']}**", '',
-                  f"- 阶段：创建 {game['age_days']} 天 · {game.get('kind', '新游')}（清洗词根：{game['clean_name']}）",
+        badge = TIMING.get(game.get('timing'), ('', 0))[0]
+        ch = set(game.get('charts') or ())
+        board = ('只在新星榜，还没进飙升榜' if ch == {RBX_UC} else '新星榜和飙升榜都有' if ch == {RBX_UC, RBX_TT}
+                 else '只在飙升榜' if ch == {RBX_TT} else '')
+        lines += ['', f"**{badge} {tag}{game['name']}**".replace('** ', '**'), '',
+                  f"- 时机：{badge} {game.get('timing_note') or '没查'}",
+                  f"- 阶段：创建 {game['age_days']} 天 · {game.get('kind', '新游')}" + (f" · {board}" if board else '')
+                  + f"（清洗词根：{game['clean_name']}）",
                   f"- 热度：在线 {game['ccu']:,} 人{change}；好评 {game['like_ratio']}%（{game['total_votes']:,} 票）",
                   '- 轻量舆情：待检（YouTube 近 7 天视频和评论区、官方社区）',
                   search_line(game.get('suggest')),
@@ -855,11 +904,12 @@ def main():
     ap.add_argument('--no-findnews', action='store_true', help='不抓 FindNews')
     ap.add_argument('--no-roblox', action='store_true', help='不抓 Roblox')
     ap.add_argument('--roblox-new-days', type=int, default=env('RADAR_RBX_NEW_DAYS', 14), help='Roblox 创建几天内算新游')
-    ap.add_argument('--roblox-max-days', type=int, default=env('RADAR_RBX_DAYS', 90), help='Roblox 创建超过几天不看')
+    ap.add_argument('--roblox-max-days', type=int, default=env('RADAR_RBX_DAYS', 60), help='Roblox 创建超过几天不看')
     ap.add_argument('--roblox-spike', type=int, default=env('RADAR_RBX_SPIKE', 50), help='老游戏比 24 小时前涨多少百分比算暴涨')
-    ap.add_argument('--roblox-min-ccu', type=int, default=env('RADAR_RBX_MIN_CCU', 500), help='Roblox 最低在线人数')
-    ap.add_argument('--roblox-max-ccu', type=int, default=env('RADAR_RBX_MAX_CCU', 15000), help='Roblox 最高在线人数')
-    ap.add_argument('--roblox-min-like', type=int, default=env('RADAR_RBX_MIN_LIKE', 85), help='Roblox 最低好评率（百分比）')
+    ap.add_argument('--roblox-min-ccu', type=int, default=env('RADAR_RBX_MIN_CCU', 300), help='Roblox 最低在线人数')
+    ap.add_argument('--roblox-max-ccu', type=int, default=env('RADAR_RBX_MAX_CCU', 10000), help='Roblox 最高在线人数（再多竞品早到了）')
+    ap.add_argument('--roblox-min-like', type=int, default=env('RADAR_RBX_MIN_LIKE', 80), help='Roblox 最低好评率（百分比）')
+    ap.add_argument('--roblox-min-votes', type=int, default=env('RADAR_RBX_MIN_VOTES', 200), help='Roblox 最少投票数')
     ap.add_argument('--no-save', action='store_true', help='试跑：不写账本')
     o = ap.parse_args()
     log = []
